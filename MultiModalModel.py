@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf.symbol_database")
 import tkinter as tk 
 import customtkinter as ck 
 import pandas as pd 
@@ -6,151 +8,157 @@ import pickle
 import mediapipe as mp
 import cv2
 from PIL import Image, ImageTk 
-from landmarks import landmarks  # Ensure this is correctly imported
+from landmarks import landmarks
 from collections import deque
-import openai  # Ensure openai is installed and you have access to the API
+from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
 
 # Initialize Tkinter window
 window = tk.Tk()
-window.geometry("800x700")  # Increased width to ensure full frame is visible
+window.geometry("800x720")  # Increase height to fit all elements
 window.title("Rep Counter") 
 ck.set_appearance_mode("dark")
+window.configure(bg="lightgray")
 
-# Labels
-classLabel = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="black", padx=10)
-classLabel.place(x=10, y=1)
-classLabel.configure(text='STAGE') 
-counterLabel = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="black", padx=10)
-counterLabel.place(x=160, y=1)
-counterLabel.configure(text='REPS') 
-probLabel  = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="black", padx=10)
-probLabel.place(x=300, y=1)
-probLabel.configure(text='PROB') 
-classBox = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="white", fg_color="blue")
-classBox.place(x=10, y=41)
-classBox.configure(text='0') 
-counterBox = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="white", fg_color="blue")
-counterBox.place(x=160, y=41)
-counterBox.configure(text='0') 
-probBox = ck.CTkLabel(window, height=40, width=120, text_color="white", fg_color="blue")
-probBox.place(x=300, y=41)
-probBox.configure(text='0') 
+# Initialize labels and buttons
+def init_ui():
+    labels = [
+        ("STAGE", 10), ("REPS", 160), ("PROB", 300)
+    ]
+    for text, x in labels:
+        label = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="black", padx=10)
+        label.place(x=x, y=1)
+        label.configure(text=text)
+        
+        box = ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="white", fg_color="blue")
+        box.place(x=x, y=41)
+        box.configure(text='0')
+        
+    global classBox, counterBox, probBox, feedback_text, feedback_frame
+    classBox, counterBox, probBox = [ck.CTkLabel(window, height=40, width=120, font=("Arial", 20), text_color="white", fg_color="blue") for _ in range(3)]
+    classBox.place(x=10, y=41)
+    counterBox.place(x=160, y=41)
+    probBox.place(x=300, y=41)
+    
+    reset_button = ck.CTkButton(window, text='RESET', command=reset_counter, height=40, width=120, font=("Arial", 20), text_color="white", fg_color="blue")
+    reset_button.place(x=10, y=630)
+    
+    replay_button = ck.CTkButton(window, text='REPLAY ERRORS', command=replay_incorrect_frames, height=40, width=180, font=("Arial", 20), text_color="white", fg_color="red")
+    replay_button.place(x=160, y=630)
 
-# Feedback label
-feedbackLabel = ck.CTkLabel(window, height=40, width=640, font=("Arial", 16), text_color="red")
-feedbackLabel.place(x=10, y=530)
-feedbackLabel.configure(text='')
+    global feedback_text
+    feedback_frame = ck.CTkFrame(window, width=780, height=120, fg_color="red")  # Change to a distinctive color
+    feedback_frame.place(x=10, y=580)  # Adjust y-coordinate to be below the video frame
+    feedback_frame.pack_propagate(False)  # Prevent the frame from shrinking
 
-# Reset counter
-def reset_counter(): 
-    global counter
-    counter = 0 
+    feedback_text = ck.CTkTextbox(feedback_frame, width=760, height=110, font=("Arial", 14), text_color="white", fg_color="blue", wrap="word")
+    feedback_text.pack(fill="both", expand=True, padx=10, pady=5)
+    feedback_text.insert("1.0", "LLM feedback will appear here")
+    feedback_text.configure(state="disabled")  # Make it read-only
 
-button = ck.CTkButton(window, text='RESET', command=reset_counter, height=40, width=120, font=("Arial", 20), text_color="white", fg_color="blue")
-button.place(x=10, y=600)
+    # Force update the window to ensure all elements are drawn
+    window.update_idletasks()
 
-# Frame for video feed
-frame = tk.Frame(height=480, width=640)  # Adjusted width for full view
-frame.place(x=10, y=90) 
-lmain = tk.Label(frame) 
-lmain.place(x=0, y=0) 
+    # Print debug information
+    print(f"Window size: {window.winfo_width()}x{window.winfo_height()}")
+    print(f"Feedback frame: x={feedback_frame.winfo_x()}, y={feedback_frame.winfo_y()}, width={feedback_frame.winfo_width()}, height={feedback_frame.winfo_height()}")
+    print(f"Feedback text: x={feedback_text.winfo_x()}, y={feedback_text.winfo_y()}, width={feedback_text.winfo_width()}, height={feedback_text.winfo_height()}")
 
-# Mediapipe initialization
+    # Print information about all widgets
+    for widget in window.winfo_children():
+        print(f"Widget: {widget}, Position: x={widget.winfo_x()}, y={widget.winfo_y()}, width={widget.winfo_width()}, height={widget.winfo_height()}")
+
+# Function to update feedback text
+def update_feedback(text):
+    feedback_text.configure(state="normal")
+    feedback_text.delete("1.0", tk.END)
+    feedback_text.insert("1.0", text)
+    feedback_text.configure(state="disabled")
+
+# Initialize video frame
+def init_video_frame():
+    frame = tk.Frame(height=480, width=640)
+    frame.place(x=10, y=90) 
+    global lmain
+    lmain = tk.Label(frame) 
+    lmain.place(x=0, y=0)
+
+# Initialize MediaPipe
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(min_tracking_confidence=0.7, min_detection_confidence=0.7)  # Increased confidence thresholds
+pose = mp_pose.Pose(min_tracking_confidence=0.7, min_detection_confidence=0.7)
 
-# Load the new scaler and model
-with open('scaler_deadlift.pkl', 'rb') as scaler_file:
-    scaler = pickle.load(scaler_file)
-with open('random_forest_model_deadlift.pkl', 'rb') as model_file:
-    loaded_rf = pickle.load(model_file)
+# Load model and scaler
+with open('scaler_deadlift.pkl', 'rb') as f:
+    scaler = pickle.load(f)
+with open('random_forest_model_deadlift.pkl', 'rb') as f:
+    loaded_rf = pickle.load(f)
 
-# Initialize video capture from video file
-video_path = '/Users/soheilsaneei/Desktop/Fitness App/Me_doing_deadlifts.mov'  # Change this to the path of your video file
+# Initialize video capture
+video_path = '/Users/soheilsaneei/Desktop/Fitness App/Me_doing_deadlifts.mov'
 cap = cv2.VideoCapture(video_path)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Set width
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Set height
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-if not cap.isOpened():
-    print("Error: Could not open video capture.")
-else:
-    print("Video capture opened successfully.")
+# Initialize Anthropic client
+anthropic = Anthropic(api_key='EnterYourAPIKEY')
 
-bounding_box = {
-    'x_min': 100,   # Adjusted x_min
-    'y_min': 50,   # Adjusted y_min
-    'x_max': 540,   # Adjusted x_max
-    'y_max': 430    # Adjusted y_max
-}
-
+# Global variables
 current_stage = ''
 counter = 0 
 bodylang_prob = np.array([0,0]) 
 bodylang_class = '' 
+state_buffer = deque(maxlen=5)
+incorrect_frames = []
+form_issues = {"back_straight": 0}
+bounding_box = {'x_min': 100, 'y_min': 50, 'x_max': 540, 'y_max': 430}
 
-# Buffer for state transitions
-state_buffer = deque(maxlen=5)  # Buffer size of 5 frames
-incorrect_frames = []  # Store frames with incorrect form
-
-# OpenAI API Setup
-openai.api_key = 'your_openai_api_key_here'
-
-def verbal_feedback(feedback):
-    response = openai.Completion.create(
-        engine="text-davinci-003",  # Adjust according to the model version
-        prompt=feedback,
-        max_tokens=50
-    )
-    feedback_text = response.choices[0].text.strip()
-
-    # Convert the feedback text to speech using OpenAI's TTS capabilities
-    openai.Audio.create(text=feedback_text, voice="en-US-Wavenet-D")
+def reset_counter(): 
+    global counter
+    counter = 0 
 
 def replay_incorrect_frames():
     for frame in incorrect_frames:
         cv2.imshow("Incorrect Rep", frame)
-        cv2.waitKey(500)  # Display each frame for 500ms
+        cv2.waitKey(500)
 
-# Button for replaying incorrect frames
-replayButton = ck.CTkButton(window, text='REPLAY ERRORS', command=replay_incorrect_frames, height=40, width=180, font=("Arial", 20), text_color="white", fg_color="red")
-replayButton.place(x=160, y=600)
+def get_llm_feedback(rep_count, form_issues, current_stage):
+    print(f"Generating feedback for rep {rep_count}")  # Debug print
+    try:
+        prompt = f"{HUMAN_PROMPT}I'm analyzing a deadlift exercise. Here's the current status:\n" \
+                 f"- Completed reps: {rep_count}\n" \
+                 f"- Current stage: {current_stage}\n" \
+                 f"- Form issues: {form_issues}\n\n" \
+                 f"Based on this information, can you provide:\n" \
+                 f"1. A brief assessment of the performance\n" \
+                 f"2. Specific feedback on form\n" \
+                 f"3. A suggestion for improvement\n\n" \
+                 f"Please keep your response concise, within 2-3 sentences for each point.{AI_PROMPT}"
 
-# Form issue tracking
-form_issues = {
-    "back_straight": 0,
-}
+        response = anthropic.completions.create(
+            model="claude-2.0",
+            max_tokens_to_sample=300,
+            prompt=prompt
+        )
+        return response.completion.strip()
+    except Exception as e:
+        print(f"Error in get_llm_feedback: {e}")
+        return f"Test feedback for rep {rep_count}. Form issues: {form_issues}. Current stage: {current_stage}"
 
-def detect(): 
-    global current_stage
-    global counter
-    global bodylang_class
-    global bodylang_prob 
-    global state_buffer
-    global incorrect_frames
-    global form_issues
+def detect():
+    print("Detect function called")  # Debug print
+    global current_stage, counter, bodylang_class, bodylang_prob, state_buffer, incorrect_frames, form_issues
 
     ret, frame = cap.read()
-    if not ret:
-        print("Failed to capture image or end of video reached")
-        window.after(10, detect)
+    if not ret or frame is None or frame.size == 0:
+        print("End of video reached. Closing application.")
+        window.quit()  # This will close the Tkinter window
         return
 
-    # Check if frame is valid
-    if frame is None or frame.size == 0:
-        print("Empty frame received")
-        window.after(10, detect)
-        return
-
-    # Maintain aspect ratio
+    # Resize frame
     h, w, _ = frame.shape
     aspect_ratio = w / h
-    if aspect_ratio > 1:
-        new_width = 640
-        new_height = int(new_width / aspect_ratio)
-    else:
-        new_height = 480
-        new_width = int(new_height * aspect_ratio)
+    new_width = 640 if aspect_ratio > 1 else int(480 * aspect_ratio)
+    new_height = int(new_width / aspect_ratio) if aspect_ratio > 1 else 480
     frame = cv2.resize(frame, (new_width, new_height))
 
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) 
@@ -171,16 +179,12 @@ def detect():
             try: 
                 row = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten().tolist()
                 X = pd.DataFrame([row], columns = landmarks) 
-                X = scaler.transform(X)  # Standardize the real-time data
+                X = scaler.transform(X)
                 bodylang_prob = loaded_rf.predict_proba(X)[0]
                 bodylang_class = loaded_rf.predict(X)[0] 
 
-                print(f"Class: {bodylang_class}, Probability: {bodylang_prob[bodylang_prob.argmax()]}")
-
-                # Add current classification to buffer
                 state_buffer.append(bodylang_class)
 
-                # Use the most frequent state in the buffer
                 if len(state_buffer) == state_buffer.maxlen:
                     most_common_state = max(set(state_buffer), key=state_buffer.count)
 
@@ -188,33 +192,41 @@ def detect():
                         current_stage = "down" 
                     elif current_stage == "down" and most_common_state == "up" and bodylang_prob[bodylang_prob.argmax()] > 0.6:
                         current_stage = "up" 
-                        counter += 1 
+                        counter += 1
+                        print(f"Rep completed. Counter: {counter}")  # Debug print
+                        
+                        # Get LLM feedback every 5 reps or when form issues are detected
+                        if counter % 5 == 0 or form_issues["back_straight"] > 0:
+                            print(f"Attempting to generate feedback. Counter: {counter}, Form issues: {form_issues}")  # Debug print
+                            llm_feedback = get_llm_feedback(counter, form_issues, current_stage)
+                            
+                            # Print LLM feedback to console
+                            print("LLM Feedback:")
+                            print(llm_feedback)
+                            print("-" * 50)  # Separator for readability
 
-                # Form Analysis: check if the user's back is straight
+                            # Display feedback in GUI
+                            update_feedback(llm_feedback)
+                            window.update_idletasks()  # Force update
+                            
+                            # Reset form issues after getting feedback
+                            form_issues = {"back_straight": 0}
+
+                # Form Analysis
                 shoulder_y = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_SHOULDER].y
                 hip_y = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_HIP].y
                 if shoulder_y > hip_y:
                     feedback_text = "Keep your back straight!"
                     incorrect_frames.append(frame.copy())
-                    verbal_feedback(feedback_text)
                     form_issues["back_straight"] += 1
-                else:
-                    feedback_text = ""
-
-                feedbackLabel.configure(text=feedback_text)
-                
-                # Suggest alternative exercises if issues persist
-                if form_issues["back_straight"] > 5:
-                    suggestion = "Consider strengthening your core with planks or glute bridges."
-                    verbal_feedback(suggestion)
-                    feedbackLabel.configure(text=suggestion)
+                    update_feedback(feedback_text)
+                    window.update_idletasks()
 
             except Exception as e: 
                 print(f"Error during detection: {e}") 
 
-    img = image[:, :, :]  # Ensure full image is used
-    imgarr = Image.fromarray(img) 
-    imgtk = ImageTk.PhotoImage(imgarr) 
+    img = Image.fromarray(image)
+    imgtk = ImageTk.PhotoImage(img) 
     lmain.imgtk = imgtk 
     lmain.configure(image=imgtk)
     lmain.after(10, detect)  
@@ -223,6 +235,8 @@ def detect():
     probBox.configure(text=f"{bodylang_prob[bodylang_prob.argmax()]:.2f}") 
     classBox.configure(text=current_stage) 
 
-print("Starting detection...")
-detect() 
-window.mainloop()
+if __name__ == "__main__":
+    init_ui()
+    init_video_frame()
+    detect()
+    window.mainloop()
